@@ -10,6 +10,7 @@ import enum
 import time
 from typing import Optional
 
+from model.expert import QuantizedMixtralExpert
 import torch
 
 
@@ -37,7 +38,7 @@ class CacheEntry:
         expert_id: Index of the MoE expert (0-based, within a layer).
         layer_id: Index of the transformer layer this expert belongs to.
         device: Device string, e.g. ``"cuda:0"`` or ``"cpu"``.
-        tensor: The expert weight tensor, or ``None`` if not yet loaded.
+        expert: The expert weight tensor, or ``None`` if not yet loaded.
         last_access: UNIX timestamp of the most recent cache hit.
         access_count: Total number of times this entry has been accessed.
         size_bytes: Memory footprint of the tensor in bytes.
@@ -46,7 +47,7 @@ class CacheEntry:
     expert_id: int
     layer_id: int
     device: str
-    tensor: Optional[torch.Tensor]
+    expert: Optional[QuantizedMixtralExpert]
     last_access: float
     access_count: int
     size_bytes: int

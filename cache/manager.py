@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 import time
 from typing import Optional
+from model.expert import QuantizedMixtralExpert
 
 import torch
 
@@ -212,7 +213,7 @@ class CacheManager:
     # Public API                                                           #
     # ------------------------------------------------------------------ #
 
-    def get(self, layer_id: int, expert_id: int) -> Optional[torch.Tensor]:
+    def get(self, layer_id: int, expert_id: int) -> Optional[QuantizedMixtralExpert]:
         """Look up an expert tensor in the cache.
 
         Checks the GPU tier first (O(1) dict lookup), then CPU.  Updates
@@ -232,16 +233,23 @@ class CacheManager:
             entry = self._gpu_cache[key]
             self._touch(key, entry)
             self._stats.hits += 1
-            self._logger.debug("GPU cache HIT  layer=%d expert=%d", layer_id, expert_id)
-            return entry.tensor
+            self._logger.debug(
+                "GPU cache HIT layer=%d expert=%d",
+                layer_id,
+                expert_id,
+            )
+            return entry.expert
 
-        # CPU hit
         if key in self._cpu_cache:
             entry = self._cpu_cache[key]
             self._touch(key, entry)
             self._stats.hits += 1
-            self._logger.debug("CPU cache HIT  layer=%d expert=%d", layer_id, expert_id)
-            return entry.tensor
+            self._logger.debug(
+                "CPU cache HIT layer=%d expert=%d",
+                layer_id,
+                expert_id,
+            )
+            return entry.expert
 
         # Miss
         self._stats.misses += 1
@@ -255,7 +263,7 @@ class CacheManager:
         self,
         layer_id: int,
         expert_id: int,
-        tensor: torch.Tensor,
+        expert: QuantizedMixtralExpert,
         device: str,
     ) -> None:
         """Insert or refresh an expert tensor in the cache.
@@ -277,7 +285,7 @@ class CacheManager:
         if key in cache:
             # Refresh existing entry — no slot consumed
             entry = cache[key]
-            entry.tensor = tensor
+            entry.expert = expert
             entry.device = device
             self._touch(key, entry)
             self._logger.debug(
@@ -300,10 +308,10 @@ class CacheManager:
             expert_id=expert_id,
             layer_id=layer_id,
             device=device,
-            tensor=tensor,
+            expert=expert,
             last_access=now,
             access_count=1,
-            size_bytes=tensor.nelement() * tensor.element_size(),
+            size_bytes=expert.size_bytes,
         )
         cache[key] = entry
 
@@ -354,6 +362,9 @@ class CacheManager:
             return None
 
         evicted = cache.pop(victim_key)
+        if device.startswith("cuda"):
+            evicted.expert = evicted.expert.cpu()
+            evicted.device = "cpu"
 
         if self.policy == EvictionPolicy.ARC:
             self._arc_for(device).remove(victim_key)
@@ -417,7 +428,7 @@ class CacheManager:
 
         # Move tensor
         gpu_device = "cuda:0"
-        entry.tensor = entry.tensor.to(gpu_device, non_blocking=True)
+        entry.expert = entry.expert.cuda()
         entry.device = gpu_device
         entry.last_access = time.monotonic()
 
