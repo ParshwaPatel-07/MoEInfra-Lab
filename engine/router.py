@@ -68,15 +68,20 @@ class ExpertRouter:
             self.gate_weight,
         )
 
-    def route(
+    def route(self, hidden_states):
+        _, expert_weights, expert_indices = self.route_with_logits(hidden_states)
+        return expert_indices, expert_weights
+
+    def route_with_logits(
         self,
         hidden_states: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute top-k expert assignments."""
-
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         router_logits = self.logits(hidden_states)
 
-        routing_weights = F.softmax(router_logits, dim=-1)
+        routing_weights = F.softmax(
+            router_logits.float(),
+            dim=-1,
+        )
 
         expert_weights, expert_indices = torch.topk(
             routing_weights,
@@ -84,13 +89,10 @@ class ExpertRouter:
             dim=-1,
         )
 
-        expert_weights = expert_weights / expert_weights.sum(
-            dim=-1,
-            keepdim=True,
-        )
+        expert_weights /= expert_weights.sum(dim=-1, keepdim=True)
 
-        return expert_indices, expert_weights
-
+        return router_logits, expert_weights, expert_indices
+    
     def predict_next_layer_experts(
         self,
         current_expert_indices: torch.Tensor,
