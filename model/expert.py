@@ -68,3 +68,15 @@ class QuantizedMixtralExpert(nn.Module):
         up = self.w3(x)
 
         return self.w2(F.silu(gate) * up)
+
+    @property
+    def device(self) -> torch.device:
+        return self.w1.weight.device
+
+
+    @property
+    def size_bytes(self) -> int:
+        return sum(
+            layer.weight.numel() * layer.weight.element_size()
+            for layer in (self.w1, self.w2, self.w3)
+        )
