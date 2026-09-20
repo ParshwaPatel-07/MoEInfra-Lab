@@ -416,9 +416,13 @@ class CacheManager:
 
         # Make room in the GPU tier if needed
         if len(self._gpu_cache) >= self.gpu_slots:
-            if self.evict("cuda") is None:
-                self._logger.error("promote_to_gpu: GPU tier full, eviction failed")
-                return False
+            evicted = self.evict("cuda")
+
+            if evicted is not None:
+                if len(self._cpu_cache) >= self.cpu_slots:
+                    self.evict("cpu")
+
+                self._cpu_cache[(evicted.layer_id, evicted.expert_id)] = evicted
 
         # Pop from CPU tier
         entry = self._cpu_cache.pop(key)
