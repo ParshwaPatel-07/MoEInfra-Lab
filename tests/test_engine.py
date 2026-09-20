@@ -19,10 +19,12 @@ from engine.types import ForwardRequest, PrefetchPolicy
 
 class TestExpertRouter:
     """ExpertRouter tests."""
-
     def _make_router(self) -> ExpertRouter:
-        return ExpertRouter(num_experts=8, num_experts_per_tok=2)
-
+        gate_weight = torch.randn(8, 4096, dtype=torch.float32)
+        return ExpertRouter(
+            gate_weight=gate_weight,
+            num_experts_per_tok=2,
+        )
     def test_route_output_shapes(self) -> None:
         """route() should return tensors with shape (tokens, k)."""
         router = self._make_router()

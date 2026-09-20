@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from time import time
+import time
 from typing import Optional
 
 import torch

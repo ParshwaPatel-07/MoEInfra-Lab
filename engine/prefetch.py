@@ -116,7 +116,7 @@ class PrefetchEngine:
         Returns:
             ``True`` if a tensor was returned (GPU or CPU resident).
         """
-        return self._cache_manager.get(layer_id, expert_id) is not None
+        return self._cache_manager.is_gpu_resident(layer_id, expert_id)
 
     def _submit_if_needed(
         self, layer_id: int, expert_id: int
@@ -146,7 +146,6 @@ class PrefetchEngine:
             direction=TransferDirection.CPU_TO_GPU,
             priority=TransferPriority.LOW,  # Prefetch = background priority
             issued_at=time.monotonic(),
-            tensor=None,  # Scheduler will fetch from CPU cache
         )
         self._transfer_scheduler.submit(request)
         self._in_flight[key] = request_id

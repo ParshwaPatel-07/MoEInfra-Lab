@@ -536,3 +536,6 @@ class CacheManager:
             f"cpu={len(self._cpu_cache)}/{self.cpu_slots}, "
             f"policy={self.policy.value})"
         )
+
+    def is_gpu_resident(self, layer_id: int, expert_id: int) -> bool:
+        return (layer_id, expert_id) in self._gpu_cache
