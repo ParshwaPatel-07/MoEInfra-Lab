@@ -447,6 +447,76 @@ class CacheManager:
         )
         return True
 
+    def demote_to_cpu(self, layer_id: int, expert_id: int) -> bool:
+        """Move a GPU-resident expert to CPU memory.
+
+        If the CPU tier is full, one CPU entry is evicted first. The same
+        ``CacheEntry`` is then inserted into the CPU cache after moving its
+        expert to CPU memory.
+
+        Returns:
+            ``True`` if the demotion succeeded, ``False`` if the expert is not
+            in the GPU cache or CUDA is unavailable.
+        """
+        key = (layer_id, expert_id)
+
+        if key not in self._gpu_cache:
+            self._logger.debug(
+                "demote_to_cpu: (layer=%d, expert=%d) not in GPU cache",
+                layer_id,
+                expert_id,
+            )
+            return False
+
+        if not torch.cuda.is_available():
+            self._logger.warning(
+                "demote_to_cpu: CUDA unavailable; skipped for layer=%d expert=%d",
+                layer_id,
+                expert_id,
+            )
+            return False
+
+        if len(self._cpu_cache) >= self.cpu_slots:
+            self.evict("cpu")
+
+        entry = self._gpu_cache.pop(key)
+        self._stats.gpu_slots_used = len(self._gpu_cache)
+
+        if self.policy == EvictionPolicy.ARC:
+            self._arc_gpu.remove(key)
+
+        entry.expert = entry.expert.cpu()
+        entry.device = "cpu"
+        entry.last_access = time.monotonic()
+
+        self._cpu_cache[key] = entry
+        self._stats.cpu_slots_used = len(self._cpu_cache)
+
+        if self.policy == EvictionPolicy.ARC:
+            self._arc_cpu.t1.append(key)
+
+        self._logger.debug(
+            "demote_to_cpu: layer=%d expert=%d GPU → CPU",
+            layer_id,
+            expert_id,
+        )
+        return True
+
+    def get_size_bytes(self, layer_id: int, expert_id: int) -> int:
+        """Return the cached expert size in bytes without touching statistics."""
+        key = (layer_id, expert_id)
+
+        entry = self._gpu_cache.get(key)
+        if entry is None:
+            entry = self._cpu_cache.get(key)
+
+        if entry is None:
+            raise KeyError(
+                f"Expert not present in cache: layer={layer_id}, expert={expert_id}"
+            )
+
+        return entry.size_bytes
+
     # ------------------------------------------------------------------ #
     # Fully-implemented helpers                                            #
     # ------------------------------------------------------------------ #
