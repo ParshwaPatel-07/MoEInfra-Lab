@@ -14,7 +14,7 @@ class StagingSlot:
     tensors: dict[str, dict[str, torch.Tensor]]
     in_use: bool = False
     ready_event: torch.cuda.Event | None = None
-
+    expert_key: tuple[int, int] | None = None
 
 class ReusablePinnedStagingPool:
     """
@@ -113,3 +113,79 @@ class ReusablePinnedStagingPool:
     def destroy(self) -> None:
         self._slots.clear()
         self.budget.used_bytes = 0
+
+    def _expert_staging_size(expert) -> int:
+        total = 0
+
+        for name in ("w1", "w2", "w3"):
+            param = getattr(expert, name).weight
+            qs = param.quant_state
+
+            total += param.numel() * param.element_size()
+            total += qs.absmax.numel() * qs.absmax.element_size()
+            total += qs.code.numel() * qs.code.element_size()
+
+            if qs.offset is not None:
+                total += qs.offset.numel() * qs.offset.element_size()
+
+            if qs.state2 is not None:
+                total += qs.state2.absmax.numel() * qs.state2.absmax.element_size()
+                total += qs.state2.code.numel() * qs.state2.code.element_size()
+
+                if qs.state2.offset is not None:
+                    total += (
+                        qs.state2.offset.numel()
+                        * qs.state2.offset.element_size()
+                    )
+
+        return total
+
+    def _stage_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+        pinned = torch.empty_like(tensor, pin_memory=True)
+        pinned.copy_(tensor)
+        return pinned
+
+    def stage_expert(
+        self,
+        slot: StagingSlot,
+        expert,
+        layer_id: int,
+        expert_id: int,
+    ) -> None:
+        if not slot.in_use:
+            raise RuntimeError("Slot must be acquired before staging")
+
+        staged = {}
+
+        for name in ("w1", "w2", "w3"):
+            param = getattr(expert, name).weight
+            qs = param.quant_state
+
+            state = {
+                "weight": self._stage_tensor(param.data),
+                "absmax": self._stage_tensor(qs.absmax),
+                "code": self._stage_tensor(qs.code),
+                "offset": (
+                    None
+                    if qs.offset is None
+                    else self._stage_tensor(qs.offset)
+                ),
+            }
+
+            if qs.state2 is not None:
+                state["state2_absmax"] = self._stage_tensor(
+                    qs.state2.absmax
+                )
+                state["state2_code"] = self._stage_tensor(
+                    qs.state2.code
+                )
+                state["state2_offset"] = (
+                    None
+                    if qs.state2.offset is None
+                    else self._stage_tensor(qs.state2.offset)
+                )
+
+            staged[name] = state
+
+        slot.tensors = staged
+        slot.expert_key = (layer_id, expert_id)
