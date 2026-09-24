@@ -155,37 +155,63 @@ class ReusablePinnedStagingPool:
         if not slot.in_use:
             raise RuntimeError("Slot must be acquired before staging")
 
+        old_tensors = slot.tensors
+
         staged = {}
 
         for name in ("w1", "w2", "w3"):
             param = getattr(expert, name).weight
             qs = param.quant_state
 
+            old_state = old_tensors.get(name, {})
+
             state = {
-                "weight": self._stage_tensor(param.data),
-                "absmax": self._stage_tensor(qs.absmax),
-                "code": self._stage_tensor(qs.code),
-                "offset": (
-                    None
-                    if qs.offset is None
-                    else self._stage_tensor(qs.offset)
+                "weight": self._copy_into_pinned(
+                    param.data,
+                    old_state.get("weight"),
+                ),
+                "absmax": self._copy_into_pinned(
+                    qs.absmax,
+                    old_state.get("absmax"),
+                ),
+                "code": self._copy_into_pinned(
+                    qs.code,
+                    old_state.get("code"),
+                ),
+                "offset": self._copy_into_pinned(
+                    qs.offset,
+                    old_state.get("offset"),
                 ),
             }
 
             if qs.state2 is not None:
-                state["state2_absmax"] = self._stage_tensor(
-                    qs.state2.absmax
+                state["state2_absmax"] = self._copy_into_pinned(
+                    qs.state2.absmax,
+                    old_state.get("state2_absmax"),
                 )
-                state["state2_code"] = self._stage_tensor(
-                    qs.state2.code
+                state["state2_code"] = self._copy_into_pinned(
+                    qs.state2.code,
+                    old_state.get("state2_code"),
                 )
-                state["state2_offset"] = (
-                    None
-                    if qs.state2.offset is None
-                    else self._stage_tensor(qs.state2.offset)
+                state["state2_offset"] = self._copy_into_pinned(
+                    qs.state2.offset,
+                    old_state.get("state2_offset"),
                 )
 
             staged[name] = state
 
         slot.tensors = staged
         slot.expert_key = (layer_id, expert_id)
+
+    def _copy_into_pinned(self, source, existing=None):
+        if source is None:
+            return None
+
+        if existing is None:
+            existing = torch.empty_like(source, pin_memory=True)
+
+        if existing.shape != source.shape or existing.dtype != source.dtype:
+            raise ValueError("Existing staging buffer does not match source tensor")
+
+        existing.copy_(source)
+        return existing
