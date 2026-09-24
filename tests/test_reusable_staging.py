@@ -200,3 +200,58 @@ def test_mark_transfer_requires_active_slot():
 
     with pytest.raises(RuntimeError):
         pool.mark_transfer_complete(slot, stream)
+
+def test_acquire_returns_none_when_all_slots_in_use():
+    budget = PinnedMemoryBudget(800)
+
+    pool = ReusablePinnedStagingPool(
+        budget,
+        slot_size_bytes=400,
+    )
+
+    slot1 = pool.acquire()
+    slot2 = pool.acquire()
+
+    assert slot1 is not None
+    assert slot2 is not None
+
+    exhausted = pool.acquire()
+
+    assert exhausted is None
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_acquire_returns_none_when_all_slots_have_pending_events():
+    budget = PinnedMemoryBudget(800)
+
+    pool = ReusablePinnedStagingPool(
+        budget,
+        slot_size_bytes=400,
+    )
+
+    slot1 = pool.acquire()
+    slot2 = pool.acquire()
+
+    assert slot1 is not None
+    assert slot2 is not None
+
+    stream = torch.cuda.Stream()
+
+    with torch.cuda.stream(stream):
+        x = torch.randn(4096, 4096, device="cuda")
+        y = x @ x
+
+    pool.mark_transfer_complete(slot1, stream)
+    pool.mark_transfer_complete(slot2, stream)
+
+    pool.release(slot1)
+    pool.release(slot2)
+
+    exhausted = pool.acquire()
+
+    assert exhausted is None
+
+    stream.synchronize()
+
+    reusable = pool.acquire()
+
+    assert reusable is not None
