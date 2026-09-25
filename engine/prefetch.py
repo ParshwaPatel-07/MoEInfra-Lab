@@ -43,7 +43,12 @@ from typing import List, Optional
 import torch
 
 from engine.types import PrefetchPolicy
-from transfer.types import TransferDirection, TransferPriority, TransferRequest
+from transfer.types import (
+    TransferDirection,
+    TransferPriority,
+    TransferRequest,
+    TransferStatus,
+)
 
 
 class PrefetchEngine:
@@ -147,7 +152,20 @@ class PrefetchEngine:
             priority=TransferPriority.LOW,  # Prefetch = background priority
             issued_at=time.monotonic(),
         )
-        self._transfer_scheduler.submit(request)
+        handle = self._transfer_scheduler.submit_async(request)
+
+        # The scheduler owns the transfer lifecycle. Only keep bookkeeping
+        # for a transfer that was actually accepted and is now in flight.
+        if handle.status != TransferStatus.IN_FLIGHT:
+            self._logger.debug(
+                "_submit_if_needed: scheduler did not accept "
+                "layer=%d expert=%d status=%s",
+                layer_id,
+                expert_id,
+                handle.status.value,
+            )
+            return None
+
         self._in_flight[key] = request_id
 
         self._logger.debug(

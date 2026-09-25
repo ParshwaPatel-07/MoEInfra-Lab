@@ -5,7 +5,7 @@ Covers :class:`~cache.manager.CacheManager`,
 
 All tests that exercise CPU-only paths (put, get, evict, LRU/LFU ordering,
 slot counts, statistics) run without CUDA. Tests that require an actual
-GPU move (promote_to_gpu, demote_to_cpu) are guarded by
+GPU move (promote_to_gpu) are guarded by
 ``pytest.mark.skipif(not torch.cuda.is_available(), ...)``.
 
 A lightweight :class:`FakeExpert` stand-in is used throughout so that
@@ -555,13 +555,17 @@ class TestDemoteToCpu:
         """demote_to_cpu() must return False when key is absent from GPU tier."""
         assert cm_lru.demote_to_cpu(0, 99) is False
 
-    def test_returns_false_when_cuda_unavailable(
+    def test_demote_removes_gpu_residency_without_cuda(
         self, cm_lru: CacheManager
     ) -> None:
-        """demote_to_cpu() must return False (not raise) when CUDA is absent."""
-        if not CUDA_AVAILABLE:
-            self._inject_gpu_entry(cm_lru, 0, 0)
-            assert cm_lru.demote_to_cpu(0, 0) is False
+        """demote_to_cpu() should remove GPU residency without requiring CUDA."""
+        self._inject_gpu_entry(cm_lru, 0, 0)
+
+        result = cm_lru.demote_to_cpu(0, 0)
+
+        assert result is True
+        assert (0, 0) not in cm_lru._gpu_cache
+        assert cm_lru.stats().gpu_slots_used == 0
 
     @requires_cuda
     def test_demotes_entry_to_cpu_tier(self) -> None:

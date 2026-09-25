@@ -13,6 +13,8 @@ from typing import Optional
 import torch
 
 from model.expert import QuantizedMixtralExpert
+from model.types import LayerWeights
+from safetensors import safe_open
 
 
 class ModelLoader:
@@ -140,6 +142,144 @@ class ModelLoader:
             len(set(self._weight_map.values())),
         )
 
+    def _require_loaded(self) -> None:
+        """Ensure the checkpoint has been indexed before reading weights."""
+
+        if not self._is_loaded or self._checkpoint_path is None:
+            raise RuntimeError(
+                "Call ModelLoader.load() before requesting model weights."
+            )
+
+    def _load_tensors(
+        self,
+        tensor_names: dict[str, str],
+    ) -> dict[str, torch.Tensor]:
+        """Load named tensors from the indexed safetensors checkpoint.
+
+        Tensors may live in different shards. Shards are opened once per
+        shard rather than once per tensor.
+        """
+
+        self._require_loaded()
+
+        assert self._checkpoint_path is not None
+
+        # Resolve tensor -> shard.
+        try:
+            tensor_to_shard = {
+                name: self._weight_map[name]
+                for name in tensor_names.values()
+            }
+        except KeyError as exc:
+            raise RuntimeError(
+                f"Tensor not found in checkpoint index: {exc}"
+            ) from exc
+
+        # Group requested tensors by shard so each shard is opened once.
+        tensors_by_shard: dict[str, list[str]] = {}
+
+        for tensor_name, shard in tensor_to_shard.items():
+            tensors_by_shard.setdefault(shard, []).append(tensor_name)
+
+        loaded: dict[str, torch.Tensor] = {}
+
+        for shard, names in tensors_by_shard.items():
+            shard_path = self._checkpoint_path / shard
+
+            with safe_open(
+                shard_path,
+                framework="pt",
+                device="cpu",
+            ) as f:
+                for tensor_name in names:
+                    loaded[tensor_name] = f.get_tensor(tensor_name)
+
+        return loaded
+
+    def load_embeddings(self) -> torch.Tensor:
+        """Load the input token embedding matrix onto CPU."""
+
+        tensors = self._load_tensors({
+            "embedding": "model.embed_tokens.weight",
+        })
+
+        return tensors["model.embed_tokens.weight"]
+
+    def load_layer(self, layer_id: int) -> LayerWeights:
+        """Load the dense weights for one Mixtral transformer layer.
+
+        Args:
+            layer_id: Zero-based transformer layer index.
+
+        Returns:
+            LayerWeights containing the layer's dense BF16 tensors,
+            resident on CPU.
+        """
+
+        self._require_loaded()
+
+        if not (0 <= layer_id < self.num_layers):
+            raise IndexError(
+                f"layer_id {layer_id} out of range "
+                f"[0, {self.num_layers})"
+            )
+
+        prefix = f"model.layers.{layer_id}"
+
+        tensor_names = {
+            "input_layernorm":
+                f"{prefix}.input_layernorm.weight",
+
+            "q_proj":
+                f"{prefix}.self_attn.q_proj.weight",
+
+            "k_proj":
+                f"{prefix}.self_attn.k_proj.weight",
+
+            "v_proj":
+                f"{prefix}.self_attn.v_proj.weight",
+
+            "o_proj":
+                f"{prefix}.self_attn.o_proj.weight",
+
+            "post_attention_layernorm":
+                f"{prefix}.post_attention_layernorm.weight",
+
+            "moe_gate":
+                f"{prefix}.block_sparse_moe.gate.weight",
+        }
+
+        tensors = self._load_tensors(tensor_names)
+
+        return LayerWeights(
+            input_layernorm=tensors[tensor_names["input_layernorm"]],
+            q_proj=tensors[tensor_names["q_proj"]],
+            k_proj=tensors[tensor_names["k_proj"]],
+            v_proj=tensors[tensor_names["v_proj"]],
+            o_proj=tensors[tensor_names["o_proj"]],
+            post_attention_layernorm=tensors[
+                tensor_names["post_attention_layernorm"]
+            ],
+            moe_gate=tensors[tensor_names["moe_gate"]],
+        )
+    def load_final_norm(self) -> torch.Tensor:
+        """Load the final transformer RMSNorm weights onto CPU."""
+
+        tensors = self._load_tensors({
+            "final_norm": "model.norm.weight",
+        })
+
+        return tensors["model.norm.weight"]
+
+    def load_lm_head(self) -> torch.Tensor:
+        """Load the language-model output projection onto CPU."""
+
+        tensors = self._load_tensors({
+            "lm_head": "lm_head.weight",
+        })
+
+        return tensors["lm_head.weight"]
+
     def load_expert(
         self,
         layer_id: int,
@@ -200,7 +340,7 @@ class ModelLoader:
         )
 
         # Read the three BF16 tensors.
-        from safetensors import safe_open
+        
 
         with safe_open(shard_path, framework="pt", device="cpu") as f:
             w1 = f.get_tensor(tensor_names["w1"])
