@@ -1,11 +1,12 @@
-"""Synchronous expert-transfer scheduler for MoEInfra.
+"""Expert-transfer scheduler for MoEInfra.
 
 TransferScheduler owns request ordering, deduplication, cancellation, and
 transfer bookkeeping. CacheManager owns the actual expert objects and their
 CPU/GPU residency.
 
-This is intentionally synchronous. Async CUDA streams will be introduced only
-after the synchronous state transitions are validated.
+Synchronous transfers are kept for the basic path. Async CUDA transfers use a
+dedicated stream, reusable pinned staging slots, and CUDA events so staging
+memory is not reused while DMA is still in flight.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import heapq
 import logging
 import time
 from typing import Optional
+
 import torch
 
 from transfer.bandwidth import BandwidthMonitor
@@ -21,16 +23,11 @@ from transfer.types import (
     TransferDirection,
     TransferRequest,
     TransferResult,
-)
-from transfer.nf4_transfer import transfer_staged_expert_to_gpu
-from transfer.nf4_reconstruct import ReconstructedNF4Expert
-from transfer.types import (
-    TransferDirection,
-    TransferRequest,
-    TransferResult,
     TransferStatus,
     TransferHandle,
 )
+from transfer.nf4_transfer import transfer_staged_expert_to_gpu
+from transfer.nf4_reconstruct import ReconstructedNF4Expert
 
 
 class TransferScheduler:
@@ -45,24 +42,22 @@ class TransferScheduler:
         transfer_stream=None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
+        if max_concurrent <= 0:
+            raise ValueError("max_concurrent must be positive")
+
         self._cache_manager = cache_manager
         self.bandwidth_gbps = bandwidth_gbps
         self.max_concurrent = max_concurrent
         self._logger = logger or logging.getLogger(__name__)
         self._bw_monitor = BandwidthMonitor(window_s=5.0)
 
-        # Heap entries: ((priority.value, issued_at), request)
         self._heap: list[tuple[tuple[int, float], TransferRequest]] = []
-
-        # Kept separately for simple membership/cancellation.
         self._queue: list[TransferRequest] = []
         self._in_flight: list[TransferRequest] = []
 
         self._staging_pool = staging_pool
         self._transfer_stream = transfer_stream
-        self._async_in_flight: dict[
-            tuple[int, int], TransferHandle
-        ] = {}
+        self._async_in_flight: dict[tuple[int, int], TransferHandle] = {}
 
     def _is_duplicate(self, request: TransferRequest) -> bool:
         """Return True if an equivalent request is queued or executing."""
@@ -82,11 +77,13 @@ class TransferScheduler:
             ) == triple:
                 return True
 
-        return False
+        return (
+            (request.layer_id, request.expert_id)
+            in self._async_in_flight
+        )
 
     @staticmethod
     def _sort_key(request: TransferRequest) -> tuple[int, float]:
-        """Return the heap ordering key."""
         return (request.priority.value, request.issued_at)
 
     def submit(self, request: TransferRequest) -> bool:
@@ -106,23 +103,10 @@ class TransferScheduler:
             (self._sort_key(request), request),
         )
         self._queue.append(request)
-
-        self._logger.debug(
-            "submit: queued id=%s layer=%d expert=%d direction=%s priority=%s",
-            request.request_id,
-            request.layer_id,
-            request.expert_id,
-            request.direction.value,
-            request.priority.name,
-        )
         return True
 
     def execute_next(self) -> Optional[TransferResult]:
-        """Execute the highest-priority pending transfer synchronously.
-
-        CPU→GPU delegates to CacheManager.promote_to_gpu().
-        GPU→CPU delegates to CacheManager.demote_to_cpu().
-        """
+        """Execute the highest-priority pending transfer synchronously."""
         if not self._heap:
             return None
 
@@ -163,7 +147,7 @@ class TransferScheduler:
                     f"direction={request.direction.value}"
                 )
 
-        except Exception as exc:  # pylint: disable=broad-except
+        except Exception as exc:
             error = str(exc)
             self._logger.error(
                 "execute_next: FAILED id=%s error=%s",
@@ -176,12 +160,6 @@ class TransferScheduler:
 
         if success:
             self._bw_monitor.record(bytes_transferred)
-            self._logger.debug(
-                "execute_next: done id=%s bytes=%d elapsed=%.2f ms",
-                request.request_id,
-                bytes_transferred,
-                elapsed_ms,
-            )
 
         return TransferResult(
             request_id=request.request_id,
@@ -194,47 +172,60 @@ class TransferScheduler:
     def drain(self) -> list[TransferResult]:
         """Execute all pending requests in priority order."""
         results: list[TransferResult] = []
-
         while self._heap:
             result = self.execute_next()
             if result is not None:
                 results.append(result)
-
         return results
 
     def cancel(self, request_id: str) -> bool:
-        """Cancel a queued request."""
+        """Cancel queued work or mark an async CUDA transfer cancelled.
+
+        A submitted CUDA DMA operation cannot safely be aborted. Async
+        cancellation therefore marks the request cancelled and keeps its
+        staging slot alive until its CUDA event completes.
+        """
         target = next(
-            (request for request in self._queue
-             if request.request_id == request_id),
+            (
+                request
+                for request in self._queue
+                if request.request_id == request_id
+            ),
             None,
         )
 
-        if target is None:
+        if target is not None:
+            self._queue.remove(target)
+            self._heap = [
+                (self._sort_key(request), request)
+                for request in self._queue
+            ]
+            heapq.heapify(self._heap)
+            return True
+
+        async_handle = next(
+            (
+                handle
+                for handle in self._async_in_flight.values()
+                if handle.request_id == request_id
+            ),
+            None,
+        )
+
+        if async_handle is None:
             return False
 
-        self._queue.remove(target)
-        self._heap = [
-            (self._sort_key(request), request)
-            for request in self._queue
-        ]
-        heapq.heapify(self._heap)
+        if async_handle.status != TransferStatus.IN_FLIGHT:
+            return False
 
-        self._logger.debug(
-            "cancel: removed id=%s layer=%d expert=%d",
-            target.request_id,
-            target.layer_id,
-            target.expert_id,
-        )
+        async_handle.status = TransferStatus.CANCELLED
         return True
 
     def pending_count(self) -> int:
-        """Return the number of queued requests."""
         return len(self._queue)
 
     @property
     def bandwidth_monitor(self) -> BandwidthMonitor:
-        """Return the rolling transfer-bandwidth monitor."""
         return self._bw_monitor
 
     def __repr__(self) -> str:
@@ -246,9 +237,14 @@ class TransferScheduler:
         )
 
     def submit_async(self, request: TransferRequest) -> TransferHandle:
+        """Submit a CPU→GPU expert transfer asynchronously."""
+        if request.direction != TransferDirection.CPU_TO_GPU:
+            raise ValueError(
+                "submit_async() only supports CPU_TO_GPU transfers"
+            )
+
         key = (request.layer_id, request.expert_id)
 
-        # Already resident.
         if self._cache_manager.is_gpu_resident(
             request.layer_id,
             request.expert_id,
@@ -262,10 +258,20 @@ class TransferScheduler:
                 status=TransferStatus.READY,
             )
 
-        # Already being transferred.
         existing = self._async_in_flight.get(key)
         if existing is not None:
             return existing
+
+        # Phase 1 uses a bounded number of outstanding async DMA operations.
+        if len(self._async_in_flight) >= self.max_concurrent:
+            return TransferHandle(
+                request_id=request.request_id,
+                layer_id=request.layer_id,
+                expert_id=request.expert_id,
+                slot=None,
+                event=None,
+                status=TransferStatus.REJECTED,
+            )
 
         if self._staging_pool is None or self._transfer_stream is None:
             raise RuntimeError(
@@ -273,7 +279,6 @@ class TransferScheduler:
             )
 
         slot = self._staging_pool.acquire()
-
         if slot is None:
             return TransferHandle(
                 request_id=request.request_id,
@@ -291,7 +296,6 @@ class TransferScheduler:
 
         if expert is None:
             self._staging_pool.release(slot)
-
             return TransferHandle(
                 request_id=request.request_id,
                 layer_id=request.layer_id,
@@ -326,11 +330,8 @@ class TransferScheduler:
                 event=event,
                 status=TransferStatus.IN_FLIGHT,
             )
-
-            # Keep gpu_state alive until reconstruction.
             handle.gpu_state = gpu_state
             handle.cpu_expert = expert
-
             self._async_in_flight[key] = handle
 
             return handle
@@ -344,19 +345,32 @@ class TransferScheduler:
         layer_id: int,
         expert_id: int,
     ) -> TransferStatus:
+        """Poll and finalize an async transfer."""
         key = (layer_id, expert_id)
         handle = self._async_in_flight.get(key)
 
         if handle is None:
             return TransferStatus.REJECTED
 
+        transfer_complete = handle.event.query()
+
+        # DMA cannot be aborted safely. Once complete, discard the transferred
+        # GPU state instead of reconstructing/publishing the cancelled expert.
         if handle.status == TransferStatus.CANCELLED:
+            if not transfer_complete:
+                return TransferStatus.CANCELLED
+
+            self._staging_pool.mark_transfer_complete(
+                handle.slot,
+                self._transfer_stream,
+            )
+            self._staging_pool.release(handle.slot)
+            del self._async_in_flight[key]
             return TransferStatus.CANCELLED
 
-        if not handle.event.query():
+        if not transfer_complete:
             return TransferStatus.IN_FLIGHT
 
-        # H2D has completed. Now reconstruct.
         try:
             reconstructed = ReconstructedNF4Expert(
                 handle.cpu_expert,
@@ -379,7 +393,6 @@ class TransferScheduler:
             self._staging_pool.release(handle.slot)
 
             del self._async_in_flight[key]
-
             return TransferStatus.READY
 
         except Exception:
