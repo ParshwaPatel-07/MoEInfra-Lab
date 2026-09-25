@@ -50,3 +50,21 @@ class TransferResult:
     elapsed_ms: float
     bytes_transferred: int
     error: str | None = None
+
+class TransferStatus(enum.Enum):
+    IN_FLIGHT = "in_flight"
+    READY = "ready"
+    REJECTED = "rejected"
+    CANCELLED = "cancelled"
+
+
+@dataclasses.dataclass
+class TransferHandle:
+    request_id: str
+    layer_id: int
+    expert_id: int
+    slot: object
+    event: object
+    status: TransferStatus = TransferStatus.IN_FLIGHT
+    gpu_state: object = None
+    cpu_expert: object = None

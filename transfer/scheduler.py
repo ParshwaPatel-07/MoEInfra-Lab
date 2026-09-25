@@ -14,12 +14,22 @@ import heapq
 import logging
 import time
 from typing import Optional
+import torch
 
 from transfer.bandwidth import BandwidthMonitor
 from transfer.types import (
     TransferDirection,
     TransferRequest,
     TransferResult,
+)
+from transfer.nf4_transfer import transfer_staged_expert_to_gpu
+from transfer.nf4_reconstruct import ReconstructedNF4Expert
+from transfer.types import (
+    TransferDirection,
+    TransferRequest,
+    TransferResult,
+    TransferStatus,
+    TransferHandle,
 )
 
 
@@ -31,6 +41,8 @@ class TransferScheduler:
         cache_manager,
         bandwidth_gbps: float,
         max_concurrent: int,
+        staging_pool=None,
+        transfer_stream=None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self._cache_manager = cache_manager
@@ -45,6 +57,12 @@ class TransferScheduler:
         # Kept separately for simple membership/cancellation.
         self._queue: list[TransferRequest] = []
         self._in_flight: list[TransferRequest] = []
+
+        self._staging_pool = staging_pool
+        self._transfer_stream = transfer_stream
+        self._async_in_flight: dict[
+            tuple[int, int], TransferHandle
+        ] = {}
 
     def _is_duplicate(self, request: TransferRequest) -> bool:
         """Return True if an equivalent request is queued or executing."""
@@ -226,3 +244,146 @@ class TransferScheduler:
             f"in_flight={len(self._in_flight)}, "
             f"bandwidth={self.bandwidth_gbps:.1f} GB/s)"
         )
+
+    def submit_async(self, request: TransferRequest) -> TransferHandle:
+        key = (request.layer_id, request.expert_id)
+
+        # Already resident.
+        if self._cache_manager.is_gpu_resident(
+            request.layer_id,
+            request.expert_id,
+        ):
+            return TransferHandle(
+                request_id=request.request_id,
+                layer_id=request.layer_id,
+                expert_id=request.expert_id,
+                slot=None,
+                event=None,
+                status=TransferStatus.READY,
+            )
+
+        # Already being transferred.
+        existing = self._async_in_flight.get(key)
+        if existing is not None:
+            return existing
+
+        if self._staging_pool is None or self._transfer_stream is None:
+            raise RuntimeError(
+                "Async transfer requires staging_pool and transfer_stream"
+            )
+
+        slot = self._staging_pool.acquire()
+
+        if slot is None:
+            return TransferHandle(
+                request_id=request.request_id,
+                layer_id=request.layer_id,
+                expert_id=request.expert_id,
+                slot=None,
+                event=None,
+                status=TransferStatus.REJECTED,
+            )
+
+        expert = self._cache_manager.peek_cpu(
+            request.layer_id,
+            request.expert_id,
+        )
+
+        if expert is None:
+            self._staging_pool.release(slot)
+
+            return TransferHandle(
+                request_id=request.request_id,
+                layer_id=request.layer_id,
+                expert_id=request.expert_id,
+                slot=None,
+                event=None,
+                status=TransferStatus.REJECTED,
+            )
+
+        try:
+            self._staging_pool.stage_expert(
+                slot,
+                expert,
+                request.layer_id,
+                request.expert_id,
+            )
+
+            gpu_state = transfer_staged_expert_to_gpu(
+                slot,
+                self._transfer_stream,
+            )
+
+            event = torch.cuda.Event()
+            with torch.cuda.stream(self._transfer_stream):
+                event.record(self._transfer_stream)
+
+            handle = TransferHandle(
+                request_id=request.request_id,
+                layer_id=request.layer_id,
+                expert_id=request.expert_id,
+                slot=slot,
+                event=event,
+                status=TransferStatus.IN_FLIGHT,
+            )
+
+            # Keep gpu_state alive until reconstruction.
+            handle.gpu_state = gpu_state
+            handle.cpu_expert = expert
+
+            self._async_in_flight[key] = handle
+
+            return handle
+
+        except Exception:
+            self._staging_pool.release(slot)
+            raise
+
+    def poll_async(
+        self,
+        layer_id: int,
+        expert_id: int,
+    ) -> TransferStatus:
+        key = (layer_id, expert_id)
+        handle = self._async_in_flight.get(key)
+
+        if handle is None:
+            return TransferStatus.REJECTED
+
+        if handle.status == TransferStatus.CANCELLED:
+            return TransferStatus.CANCELLED
+
+        if not handle.event.query():
+            return TransferStatus.IN_FLIGHT
+
+        # H2D has completed. Now reconstruct.
+        try:
+            reconstructed = ReconstructedNF4Expert(
+                handle.cpu_expert,
+                handle.gpu_state,
+            )
+
+            self._cache_manager.put(
+                layer_id,
+                expert_id,
+                reconstructed,
+                device="cuda",
+            )
+
+            handle.status = TransferStatus.READY
+
+            self._staging_pool.mark_transfer_complete(
+                handle.slot,
+                self._transfer_stream,
+            )
+            self._staging_pool.release(handle.slot)
+
+            del self._async_in_flight[key]
+
+            return TransferStatus.READY
+
+        except Exception:
+            handle.status = TransferStatus.REJECTED
+            self._staging_pool.release(handle.slot)
+            del self._async_in_flight[key]
+            raise

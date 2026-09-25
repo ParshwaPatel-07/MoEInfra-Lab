@@ -94,3 +94,10 @@ class ReconstructedNF4Expert(nn.Module):
     @property
     def device(self):
         return self.w1.weight.device
+
+    @property
+    def size_bytes(self) -> int:
+        return sum(
+            layer.weight.numel() * layer.weight.element_size()
+            for layer in (self.w1, self.w2, self.w3)
+        )

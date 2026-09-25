@@ -362,9 +362,12 @@ class CacheManager:
             return None
 
         evicted = cache.pop(victim_key)
+
+        # GPU cache entries are disposable working copies. The authoritative
+        # CPU NF4 backing copy remains in _cpu_cache, so GPU eviction must not
+        # call Params4bit.cpu() on the live GPU object.
         if device.startswith("cuda"):
-            evicted.expert = evicted.expert.cpu()
-            evicted.device = "cpu"
+            evicted.device = "cuda"
 
         if self.policy == EvictionPolicy.ARC:
             self._arc_for(device).remove(victim_key)
@@ -382,85 +385,46 @@ class CacheManager:
         return evicted
 
     def promote_to_gpu(self, layer_id: int, expert_id: int) -> bool:
-        """Move a CPU-resident entry to GPU memory.
+        """Report that direct promotion is no longer performed by CacheManager.
 
-        Removes the entry from ``_cpu_cache``, moves its tensor to
-        ``"cuda:0"`` (evicting a GPU entry first if the tier is full), and
-        inserts the updated entry into ``_gpu_cache``.
+        GPU residency is now established by TransferScheduler, which stages the
+        CPU NF4 backing copy, performs the H2D transfer, reconstructs a separate
+        GPU expert, and inserts that copy with :meth:`put`.
 
-        Returns ``False`` without raising if the entry is not in CPU cache or
-        if CUDA is unavailable (e.g. unit-test environment).
-
-        Args:
-            layer_id: Transformer layer index.
-            expert_id: Expert index within the layer.
-
-        Returns:
-            ``True`` if the promotion succeeded, ``False`` otherwise.
+        This method is retained temporarily for API compatibility. It does not
+        call ``Params4bit.cuda()`` because moving the authoritative CPU expert
+        in-place would violate the two-copy residency model.
         """
-        key = (layer_id, expert_id)
+        if self.is_gpu_resident(layer_id, expert_id):
+            return True
 
-        if key not in self._cpu_cache:
+        if self.peek_cpu(layer_id, expert_id) is None:
             self._logger.debug(
                 "promote_to_gpu: (layer=%d, expert=%d) not in CPU cache",
-                layer_id, expert_id,
+                layer_id,
+                expert_id,
             )
-            return False
-
-        if not torch.cuda.is_available():
-            self._logger.warning(
-                "promote_to_gpu: CUDA unavailable; skipped for layer=%d expert=%d",
-                layer_id, expert_id,
+        else:
+            self._logger.debug(
+                "promote_to_gpu: deferred to TransferScheduler "
+                "(layer=%d, expert=%d)",
+                layer_id,
+                expert_id,
             )
-            return False
 
-        # Make room in the GPU tier if needed
-        if len(self._gpu_cache) >= self.gpu_slots:
-            evicted = self.evict("cuda")
-
-            if evicted is not None:
-                if len(self._cpu_cache) >= self.cpu_slots:
-                    self.evict("cpu")
-
-                self._cpu_cache[(evicted.layer_id, evicted.expert_id)] = evicted
-
-        # Pop from CPU tier
-        entry = self._cpu_cache.pop(key)
-        self._stats.cpu_slots_used = len(self._cpu_cache)
-        if self.policy == EvictionPolicy.ARC:
-            self._arc_cpu.remove(key)
-
-        # Move tensor
-        gpu_device = "cuda:0"
-        entry.expert = entry.expert.cuda()
-        entry.device = gpu_device
-        entry.last_access = time.monotonic()
-
-        # Insert into GPU tier
-        self._gpu_cache[key] = entry
-        self._stats.gpu_slots_used = len(self._gpu_cache)
-        if self.policy == EvictionPolicy.ARC:
-            self._arc_gpu.t1.append(key)
-
-        self._logger.debug(
-            "promote_to_gpu: layer=%d expert=%d CPU → GPU", layer_id, expert_id
-        )
-        return True
+        return False
 
     def demote_to_cpu(self, layer_id: int, expert_id: int) -> bool:
-        """Move a GPU-resident expert to CPU memory.
+        """Remove GPU residency while retaining the CPU backing copy.
 
-        If the CPU tier is full, one CPU entry is evicted first. The same
-        ``CacheEntry`` is then inserted into the CPU cache after moving its
-        expert to CPU memory.
-
-        Returns:
-            ``True`` if the demotion succeeded, ``False`` if the expert is not
-            in the GPU cache or CUDA is unavailable.
+        The CPU cache is authoritative in the Phase 1 architecture. Therefore
+        GPU demotion simply removes the disposable GPU copy; it does not call
+        ``Params4bit.cpu()``.
         """
         key = (layer_id, expert_id)
 
-        if key not in self._gpu_cache:
+        entry = self._gpu_cache.pop(key, None)
+        if entry is None:
             self._logger.debug(
                 "demote_to_cpu: (layer=%d, expert=%d) not in GPU cache",
                 layer_id,
@@ -468,35 +432,16 @@ class CacheManager:
             )
             return False
 
-        if not torch.cuda.is_available():
-            self._logger.warning(
-                "demote_to_cpu: CUDA unavailable; skipped for layer=%d expert=%d",
-                layer_id,
-                expert_id,
-            )
-            return False
-
-        if len(self._cpu_cache) >= self.cpu_slots:
-            self.evict("cpu")
-
-        entry = self._gpu_cache.pop(key)
         self._stats.gpu_slots_used = len(self._gpu_cache)
 
         if self.policy == EvictionPolicy.ARC:
             self._arc_gpu.remove(key)
 
-        entry.expert = entry.expert.cpu()
-        entry.device = "cpu"
-        entry.last_access = time.monotonic()
-
-        self._cpu_cache[key] = entry
-        self._stats.cpu_slots_used = len(self._cpu_cache)
-
-        if self.policy == EvictionPolicy.ARC:
-            self._arc_cpu.t1.append(key)
-
+        # Keep the CPU backing copy untouched. It should already exist under
+        # the same key; no Params4bit device movement is performed here.
         self._logger.debug(
-            "demote_to_cpu: layer=%d expert=%d GPU → CPU",
+            "demote_to_cpu: removed GPU working copy "
+            "layer=%d expert=%d; CPU backing retained",
             layer_id,
             expert_id,
         )
@@ -538,4 +483,24 @@ class CacheManager:
         )
 
     def is_gpu_resident(self, layer_id: int, expert_id: int) -> bool:
+        """Return whether an expert currently has a GPU-resident copy."""
         return (layer_id, expert_id) in self._gpu_cache
+
+    def peek_cpu(
+        self,
+        layer_id: int,
+        expert_id: int,
+    ) -> Optional[QuantizedMixtralExpert]:
+        """Inspect the CPU backing copy without changing cache statistics."""
+        entry = self._cpu_cache.get((layer_id, expert_id))
+        return None if entry is None else entry.expert
+
+    def peek_gpu(
+        self,
+        layer_id: int,
+        expert_id: int,
+    ) -> Optional[QuantizedMixtralExpert]:
+        """Inspect the GPU-resident copy without changing cache statistics."""
+        entry = self._gpu_cache.get((layer_id, expert_id))
+        return None if entry is None else entry.expert
+    
