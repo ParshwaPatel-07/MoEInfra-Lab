@@ -5,10 +5,11 @@ from transformers.models.mixtral.modeling_mixtral import MixtralRotaryEmbedding
 from cache.manager import CacheManager
 from cache.types import EvictionPolicy
 from transfer.scheduler import TransferScheduler
-from cache.manager import CacheManager
-from transfer.scheduler import TransferScheduler
 from transfer.pinned_memory import PinnedMemoryBudget
 from transfer.reusable_staging import ReusablePinnedStagingPool
+from transfer.types import TransferRequest, TransferDirection, TransferPriority
+import time
+
 
 MODEL_PATH = (
     "/kaggle/input/models/mistral-ai/mixtral/"
@@ -233,3 +234,129 @@ def test_real_mixtral_decoder_layer_on_t4():
     print(f"Output device: {output.device}")
     print(f"MoE cache misses: {stats.misses}")
     print(f"GPU cache slots used: {stats.gpu_slots_used}")
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_real_mixtral_expert_eviction_and_reload():
+    from model.loader import ModelLoader
+
+    loader = ModelLoader(
+        model_name=MODEL_PATH,
+        num_layers=32,
+        num_experts=8,
+        hidden_size=4096,
+        intermediate_size=14336,
+    )
+    loader.load()
+
+    cache_manager = CacheManager(
+        gpu_slots=1,
+        cpu_slots=8,
+        policy=EvictionPolicy.LRU,
+    )
+
+    staging_budget = PinnedMemoryBudget(
+        budget_bytes=512 * 1024 * 1024,
+    )
+
+    staging_pool = ReusablePinnedStagingPool(
+        budget=staging_budget,
+        slot_size_bytes=128 * 1024 * 1024,
+    )
+
+    transfer_stream = torch.cuda.Stream()
+
+    transfer_scheduler = TransferScheduler(
+        cache_manager=cache_manager,
+        bandwidth_gbps=10.0,
+        max_concurrent=1,
+        staging_pool=staging_pool,
+        transfer_stream=transfer_stream,
+    )
+
+    # ---------------------------------------------------------
+    # Load two real experts into the CPU backing cache
+    # ---------------------------------------------------------
+    expert0 = loader.load_expert(0, 0)
+    expert1 = loader.load_expert(0, 1)
+
+    cache_manager.put(0, 0, expert0, device="cpu")
+    cache_manager.put(0, 1, expert1, device="cpu")
+
+    assert cache_manager.peek_cpu(0, 0) is not None
+    assert cache_manager.peek_cpu(0, 1) is not None
+
+    # ---------------------------------------------------------
+    # Helper: transfer one expert CPU → GPU
+    # ---------------------------------------------------------
+    def transfer_to_gpu(expert_id):
+        request = TransferRequest(
+            request_id=f"eviction-test-{expert_id}",
+            layer_id=0,
+            expert_id=expert_id,
+            direction=TransferDirection.CPU_TO_GPU,
+            priority=TransferPriority.HIGH,
+            issued_at=time.monotonic(),
+        )
+
+        assert transfer_scheduler.submit(request)
+
+        result = transfer_scheduler.execute_next()
+
+        assert result is not None
+        assert result.success is True
+
+        gpu_expert = cache_manager.peek_gpu(0, expert_id)
+
+        assert gpu_expert is not None
+        assert gpu_expert.device.type == "cuda"
+
+        return gpu_expert
+
+    # ---------------------------------------------------------
+    # 1. Load E0 onto GPU
+    # ---------------------------------------------------------
+    gpu0 = transfer_to_gpu(0)
+
+    assert cache_manager.peek_gpu(0, 0) is gpu0
+    assert cache_manager.peek_cpu(0, 0) is expert0
+
+    # Only one GPU slot exists.
+    assert cache_manager.stats().gpu_slots_used == 1
+
+    # ---------------------------------------------------------
+    # 2. Load E1 onto GPU
+    #
+    # This must evict E0 from GPU.
+    # ---------------------------------------------------------
+    gpu1 = transfer_to_gpu(1)
+
+    assert cache_manager.peek_gpu(0, 1) is gpu1
+    assert cache_manager.peek_gpu(0, 0) is None
+
+    # E0 must still exist in CPU backing storage.
+    assert cache_manager.peek_cpu(0, 0) is expert0
+    assert cache_manager.peek_cpu(0, 1) is expert1
+
+    assert cache_manager.stats().gpu_slots_used == 1
+
+    # ---------------------------------------------------------
+    # 3. Reload E0
+    #
+    # E1 must now be evicted and E0 reconstructed on GPU.
+    # ---------------------------------------------------------
+    gpu0_reloaded = transfer_to_gpu(0)
+
+    assert cache_manager.peek_gpu(0, 0) is gpu0_reloaded
+    assert cache_manager.peek_gpu(0, 1) is None
+
+    # CPU backing copies must still survive.
+    assert cache_manager.peek_cpu(0, 0) is expert0
+    assert cache_manager.peek_cpu(0, 1) is expert1
+
+    assert cache_manager.stats().gpu_slots_used == 1
+
+    torch.cuda.synchronize()
+
+    print("E0 initial GPU load: OK")
+    print("E1 GPU load + E0 eviction: OK")
+    print("E0 GPU reload + E1 eviction: OK")
