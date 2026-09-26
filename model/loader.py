@@ -316,36 +316,14 @@ class ModelLoader:
             "w3": prefix + "w3.weight",
         }
 
-        # Find the shard containing the expert.
-        try:
-            shards = {
-                self._weight_map[name]
-                for name in tensor_names.values()
-            }
-        except KeyError as exc:
-            raise RuntimeError(
-                f"Expert tensor not found in checkpoint index: {exc}"
-            ) from exc
+        # Load the three expert tensors.
+        # They may be stored across multiple safetensors shards.
+        tensors = self._load_tensors(tensor_names)
 
-        if len(shards) != 1:
-            raise RuntimeError(
-                f"Expert tensors span multiple shards: {sorted(shards)}"
-            )
+        w1 = tensors[tensor_names["w1"]]
+        w2 = tensors[tensor_names["w2"]]
+        w3 = tensors[tensor_names["w3"]]
 
-        shard_path = self._checkpoint_path / next(iter(shards))
-
-        self._logger.debug(
-            "Loading expert tensors from %s",
-            shard_path.name,
-        )
-
-        # Read the three BF16 tensors.
-        
-
-        with safe_open(shard_path, framework="pt", device="cpu") as f:
-            w1 = f.get_tensor(tensor_names["w1"])
-            w2 = f.get_tensor(tensor_names["w2"])
-            w3 = f.get_tensor(tensor_names["w3"])
 
         # Construct the real NF4 expert.
         expert = QuantizedMixtralExpert(
