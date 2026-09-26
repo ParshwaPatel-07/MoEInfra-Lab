@@ -115,7 +115,7 @@ class MoELayer:
         return expert
 
     @torch.no_grad()
-    def forward(
+    def _forward_tokens(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
@@ -169,3 +169,29 @@ class MoELayer:
                 output[token_mask] += weighted_output
 
         return output
+
+    def forward(self, hidden_states):
+
+        if hidden_states.ndim == 3:
+            batch_size, sequence_length, hidden_size = hidden_states.shape
+
+            hidden_states = hidden_states.reshape(
+                batch_size * sequence_length,
+                hidden_size,
+            )
+
+            output = self._forward_tokens(hidden_states)
+
+            return output.reshape(
+                batch_size,
+                sequence_length,
+                hidden_size,
+            )
+
+        if hidden_states.ndim == 2:
+            return self._forward_tokens(hidden_states)
+
+        raise ValueError(
+        "hidden_states must have shape "
+        "(tokens, hidden_size) or (batch, sequence, hidden_size)"
+    )

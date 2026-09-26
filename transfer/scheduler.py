@@ -126,10 +126,64 @@ class TransferScheduler:
             )
 
             if request.direction == TransferDirection.CPU_TO_GPU:
-                success = self._cache_manager.promote_to_gpu(
+                if self._staging_pool is None or self._transfer_stream is None:
+                    raise RuntimeError(
+                        "Synchronous CPU_TO_GPU transfer requires "
+                        "staging_pool and transfer_stream"
+                    )
+
+                cpu_expert = self._cache_manager.peek_cpu(
                     request.layer_id,
                     request.expert_id,
                 )
+
+                if cpu_expert is None:
+                    raise RuntimeError(
+                        f"CPU expert not found in cache: "
+                        f"layer={request.layer_id}, "
+                        f"expert={request.expert_id}"
+                    )
+
+                slot = self._staging_pool.acquire()
+
+                if slot is None:
+                    raise RuntimeError(
+                        "No staging slot available for synchronous transfer"
+                    )
+
+                try:
+                    self._staging_pool.stage_expert(
+                        slot,
+                        cpu_expert,
+                        request.layer_id,
+                        request.expert_id,
+                    )
+
+                    gpu_state = transfer_staged_expert_to_gpu(
+                        slot,
+                        self._transfer_stream,
+                    )
+
+                    # Synchronous path: wait for the DMA to finish before
+                    # reconstructing the GPU expert.
+                    self._transfer_stream.synchronize()
+
+                    gpu_expert = ReconstructedNF4Expert(
+                        cpu_expert,
+                        gpu_state,
+                    )
+
+                    self._cache_manager.put(
+                        request.layer_id,
+                        request.expert_id,
+                        gpu_expert,
+                        device="cuda:0",
+                    )
+
+                    success = True
+
+                finally:
+                    self._staging_pool.release(slot)
             elif request.direction == TransferDirection.GPU_TO_CPU:
                 success = self._cache_manager.demote_to_cpu(
                     request.layer_id,
